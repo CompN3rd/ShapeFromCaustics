@@ -36,7 +36,7 @@ Second build the PyTorch extensions by invoking `python setup.py install`. Be su
 ## Executing the code
 
 If everything is set up correctly, you can call `python shape_from_caustics.py --help` to get an overview of the parameters for simulation and reconstruction. 
-Alternatively you can also look at `hyperparameter_helper.py` to see, which parameters are available and how which might take a list of arguments.
+Alternatively you can also look at `hyperparameter_helper.py` to see, which parameters are available and which might take a list of arguments.
 A call of `python shape_from_caustics.py` will start the simulation and reconstruction of a synthetic 3D printed glass sample with sensible initial parameters (for a GPU with 24GB VRAM).
 If you have problems with `Out of memory` errors, try decreasing the `num_inner_simulations` parameter.
 For a complete overview of parameters for the result in the paper, have a look at the [supplementary material](https://openaccess.thecvf.com/content/WACV2021/supplemental/Kassubeck_Shape_From_Caustics_WACV_2021_supplemental.pdf).
