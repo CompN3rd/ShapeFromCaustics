@@ -10,7 +10,7 @@ Official PyTorch implementation of the main ideas described in our paper [Shape 
 ## Prerequisites
 
 
-- [NVidia OptiX 6.5](https://developer.nvidia.com/designworks/optix/downloads/legacy)
+- [NVidia OptiX 6.5](https://developer.nvidia.com/designworks/optix/downloads/legacy) Make sure the shared libraries are in `PATH` or `LD_LIBRARY_PATH` respectively.
 - [PyTorch >= 1.7](https://pytorch.org/)
 - [PyWavefront](https://pypi.org/project/PyWavefront/)
 - [PyTorch Wavelets](https://github.com/fbcotter/pytorch_wavelets) (for using wavelet sparsity)
