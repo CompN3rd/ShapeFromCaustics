@@ -192,9 +192,6 @@ __global__ void pds_cuda_backward_kernel(const th::PackedTensorAccessor32<scalar
 							const scalar_t g_pds         = grad_pds[channel][py][px];
 							const scalar_t d_kernel_grad = d_silverman(l2_norm, l2_sq) * E_center * g_pds;
 
-							// early stopping, if d_silverman returns 0 silverman will do so, too
-							if (d_kernel_grad <= 0) continue;
-
 							g_Ep += silverman(l2_sq) * g_pds;
 							g_xp[0] += -d_kernel_grad * (M_center[0] * cx_diff_circ_normed + M_center[3] * cy_diff_circ_normed);
 							g_xp[1] += -d_kernel_grad * (M_center[1] * cx_diff_circ_normed + M_center[4] * cy_diff_circ_normed);
