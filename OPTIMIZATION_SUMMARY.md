@@ -67,19 +67,27 @@ This document describes the optimizations applied to the photon differential spl
 
 #### 4.1 Numerical Equivalence Tests
 - `test_forward_numerical_equivalence`: Validates forward pass correctness
+  - Compares optimized CUDA kernel against reference implementation
+  - Reference implementation (`reference_pds_forward`) replicates original unoptimized kernel logic in Python/NumPy
   - Deterministic inputs with fixed seed
   - Shape validation
   - Finite value checks
   - Reproducibility verification
+  - Tight tolerance: rtol=1e-5, atol=1e-6
   
 - `test_backward_numerical_equivalence`: Validates backward pass correctness
+  - Compares optimized CUDA kernel against reference implementation
+  - Reference implementation (`reference_pds_backward`) replicates original unoptimized kernel logic
   - Gradient shape matching
   - Finite gradient checks
   - Reproducibility verification
+  - Same tight tolerances
 
 - `test_forward_backward_consistency`: End-to-end gradient test
   - Uses PyTorch autograd
   - Validates gradient computation
+
+**Reference Implementations**: The test suite includes CPU-based reference implementations (`reference_pds_forward` and `reference_pds_backward`) that exactly replicate the logic of the original unoptimized CUDA kernels. These functions use the same algorithms (Silverman kernel, offset-based loops, etc.) to serve as ground truth for validating numerical equivalence of the optimizations.
 
 #### 4.2 Performance Tests
 - `test_forward_performance_benchmark`: Forward pass timing
