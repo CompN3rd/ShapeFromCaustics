@@ -73,7 +73,7 @@ python setup.py install
 - Follow **Google C++ Style Guide** (with modifications)
 - Use `.clang-format` configuration in repository root
 - Key settings:
-  - Indent width: 4 spaces (tabs for indentation)
+  - Indentation: tabs (4-space tab width)
   - Column limit: 200
   - Pointer alignment: left (`Type* ptr`)
   - Brace wrapping: custom (braces on new line for classes, functions, namespaces)
