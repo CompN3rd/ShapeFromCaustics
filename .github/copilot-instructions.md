@@ -17,7 +17,7 @@ Reference: [Shape from Caustics: Reconstruction of 3D-Printed Glass from Simulat
 
 1. **PyOptix/** - C++/CUDA extensions for OptiX ray tracing
    - `RayTrace.cpp` - Main OptiX wrapper
-   - `PhotonDifferentialSplattig.cpp` - Photon differential splatting
+   - `PhotonDifferentialSplattig.cpp` - Photon differential splatting (note: filename has typo "Splattig")
    - `kernel/photon_differentials.cu` - CUDA kernels for differentiable rendering
    - `kernel/ray_programs.cu` - OptiX ray programs
 
