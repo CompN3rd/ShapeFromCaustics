@@ -27,6 +27,11 @@ std::vector<th::Tensor> pds_forward(th::Tensor Ep, th::Tensor xp, th::Tensor Mp,
 std::vector<th::Tensor> pds_backward(th::Tensor grad_pds, th::Tensor Ep, th::Tensor xp, th::Tensor Mp, th::Tensor cp, th::Tensor radius, int32_t max_pixel_radius)
 {
 	CHECK_INPUT(grad_pds);
+	CHECK_INPUT(Ep);
+	CHECK_INPUT(xp);
+	CHECK_INPUT(Mp);
+	CHECK_INPUT(cp);
+	CHECK_INPUT(radius);
 
 	return pds_cuda_backward(grad_pds, Ep, xp, Mp, cp, radius, max_pixel_radius);
 }
