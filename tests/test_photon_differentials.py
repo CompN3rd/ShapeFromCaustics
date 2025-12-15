@@ -2,7 +2,7 @@
 Tests for photon differential splatting CUDA kernels.
 
 This module contains tests to validate:
-1. Numerical equivalence of optimized kernels against reference implementation
+1. Numerical equivalence of optimized kernels against original unoptimized CUDA kernels
 2. Performance benchmarks to ensure no regression
 
 Tests are CUDA-aware and will skip gracefully if CUDA is not available.
@@ -11,8 +11,6 @@ Tests are CUDA-aware and will skip gracefully if CUDA is not available.
 import pytest
 import torch
 import time
-import math
-import numpy as np
 
 # Try to import the extension
 try:
@@ -26,213 +24,10 @@ except ImportError:
 CUDA_AVAILABLE = torch.cuda.is_available() if EXTENSION_AVAILABLE else False
 
 
-# Reference implementations matching the original unoptimized kernels
-def silverman_kernel(x_sq):
-    """Silverman kernel function - reference implementation."""
-    if x_sq < 1:
-        return (3.0 / math.pi) * (1 - x_sq) * (1 - x_sq)
-    return 0.0
-
-
-def d_silverman_kernel(x, x_sq):
-    """Derivative of Silverman kernel - reference implementation."""
-    if x < 1:
-        return -(12.0 / math.pi) * x * (1 - x_sq)
-    return 0.0
-
-
-def pixel_to_coord(px, py, w, h):
-    """Convert pixel coordinates to normalized coordinates [-1, 1]."""
-    cx = 2 * px / w - 1
-    cy = 2 * py / h - 1
-    return cx, cy
-
-
-def coord_to_pixel(cx, cy, w, h):
-    """Convert normalized coordinates to pixel coordinates."""
-    px = int((0.5 * cx + 0.5) * w)
-    py = int((0.5 * cy + 0.5) * h)
-    return px, py
-
-
-def matrix_multiply(M, p):
-    """Multiply 2x3 matrix M with 3D vector p."""
-    cx = M[0, 0] * p[0] + M[0, 1] * p[1] + M[0, 2] * p[2]
-    cy = M[1, 0] * p[0] + M[1, 1] * p[1] + M[1, 2] * p[2]
-    return cx, cy
-
-
-def reference_pds_forward(Ep, xp, Mp, cp, radius, output_size, max_pixel_radius):
-    """
-    Reference implementation of photon differential splatting forward pass.
-    This matches the original unoptimized CUDA kernel logic.
-    
-    Args:
-        Ep: Energy values [N]
-        xp: Photon positions [2, N] in normalized coords [-1, 1]
-        Mp: Transformation matrices [2, 3, N]
-        cp: Channel indices [1, N]
-        radius: Splat radii [N]
-        output_size: [C, H, W]
-        max_pixel_radius: Maximum radius in pixels
-    
-    Returns:
-        pds_grid: [C, H, W] output tensor
-    """
-    # Move to CPU for reference computation
-    Ep_cpu = Ep.cpu().numpy()
-    xp_cpu = xp.cpu().numpy()
-    Mp_cpu = Mp.cpu().numpy()
-    cp_cpu = cp.cpu().numpy()
-    radius_cpu = radius.cpu().numpy()
-    
-    C, H, W = output_size
-    pds_grid = np.zeros((C, H, W), dtype=np.float32)
-    
-    num_photons = Ep_cpu.shape[0]
-    
-    for idx in range(num_photons):
-        channel = cp_cpu[0, idx]
-        if channel >= C:
-            continue
-        
-        w = float(W)
-        h = float(H)
-        
-        # Constrain calculation by cutoff radius
-        rx = min(int(np.ceil(radius_cpu[idx] * 0.5 * w)), max_pixel_radius)
-        ry = min(int(np.ceil(radius_cpu[idx] * 0.5 * h)), max_pixel_radius)
-        
-        cx_center = xp_cpu[0, idx]
-        cy_center = xp_cpu[1, idx]
-        
-        px_center, py_center = coord_to_pixel(cx_center, cy_center, w, h)
-        E_center = Ep_cpu[idx]
-        M_center = Mp_cpu[:, :, idx]
-        
-        # Loop over pixel offsets (original kernel logic)
-        for y_off in range(-ry, ry + 1):
-            for x_off in range(-rx, rx + 1):
-                # Ellipse test
-                if (x_off * x_off) / (0.25 * w * w) + (y_off * y_off) / (0.25 * h * h) <= 1:
-                    px = px_center + x_off
-                    py = py_center + y_off
-                    
-                    if 0 <= px < W and 0 <= py < H:
-                        cx_diff, cy_diff = pixel_to_coord(px, py, w, h)
-                        cx_diff -= cx_center
-                        cy_diff -= cy_center
-                        
-                        cx_diff_circ, cy_diff_circ = matrix_multiply(M_center, np.array([cx_diff, cy_diff, 0]))
-                        
-                        l2_sq = cx_diff_circ * cx_diff_circ + cy_diff_circ * cy_diff_circ
-                        value = silverman_kernel(l2_sq) * E_center
-                        
-                        if value > 0:
-                            pds_grid[channel, py, px] += value
-    
-    return torch.from_numpy(pds_grid).to(Ep.device)
-
-
-def reference_pds_backward(grad_pds, Ep, xp, Mp, cp, radius, max_pixel_radius):
-    """
-    Reference implementation of photon differential splatting backward pass.
-    This matches the original unoptimized CUDA kernel logic.
-    
-    Args:
-        grad_pds: Gradient w.r.t. output [C, H, W]
-        Ep, xp, Mp, cp, radius: Same as forward
-        max_pixel_radius: Maximum radius in pixels
-    
-    Returns:
-        grad_Ep, grad_xp, grad_Mp: Gradients w.r.t. inputs
-    """
-    # Move to CPU for reference computation
-    grad_pds_cpu = grad_pds.cpu().numpy()
-    Ep_cpu = Ep.cpu().numpy()
-    xp_cpu = xp.cpu().numpy()
-    Mp_cpu = Mp.cpu().numpy()
-    cp_cpu = cp.cpu().numpy()
-    radius_cpu = radius.cpu().numpy()
-    
-    C, H, W = grad_pds_cpu.shape
-    num_photons = Ep_cpu.shape[0]
-    
-    grad_Ep = np.zeros_like(Ep_cpu)
-    grad_xp = np.zeros_like(xp_cpu)
-    grad_Mp = np.zeros_like(Mp_cpu)
-    
-    for idx in range(num_photons):
-        channel = cp_cpu[0, idx]
-        if channel >= C:
-            continue
-        
-        w = float(W)
-        h = float(H)
-        
-        rx = min(int(np.ceil(radius_cpu[idx] * 0.5 * w)), max_pixel_radius)
-        ry = min(int(np.ceil(radius_cpu[idx] * 0.5 * h)), max_pixel_radius)
-        
-        cx_center = xp_cpu[0, idx]
-        cy_center = xp_cpu[1, idx]
-        
-        px_center, py_center = coord_to_pixel(cx_center, cy_center, w, h)
-        E_center = Ep_cpu[idx]
-        M_center = Mp_cpu[:, :, idx]
-        
-        g_Ep_local = 0.0
-        g_xp_local = np.zeros(2)
-        g_Mp_local = np.zeros((2, 3))
-        
-        # Loop over pixel offsets (original kernel logic)
-        for y_off in range(-ry, ry + 1):
-            for x_off in range(-rx, rx + 1):
-                if (x_off * x_off) / (0.25 * w * w) + (y_off * y_off) / (0.25 * h * h) <= 1:
-                    px = px_center + x_off
-                    py = py_center + y_off
-                    
-                    if 0 <= px < W and 0 <= py < H:
-                        cx_diff, cy_diff = pixel_to_coord(px, py, w, h)
-                        cx_diff -= cx_center
-                        cy_diff -= cy_center
-                        
-                        cx_diff_circ, cy_diff_circ = matrix_multiply(M_center, np.array([cx_diff, cy_diff, 0]))
-                        
-                        l2_sq = cx_diff_circ * cx_diff_circ + cy_diff_circ * cy_diff_circ
-                        l2_norm = np.sqrt(l2_sq)
-                        
-                        if l2_norm > 0:
-                            cx_diff_circ_normed = cx_diff_circ / l2_norm
-                            cy_diff_circ_normed = cy_diff_circ / l2_norm
-                        else:
-                            cx_diff_circ_normed = 0.0
-                            cy_diff_circ_normed = 0.0
-                        
-                        g_pds = grad_pds_cpu[channel, py, px]
-                        d_kernel_grad = d_silverman_kernel(l2_norm, l2_sq) * E_center * g_pds
-                        
-                        g_Ep_local += silverman_kernel(l2_sq) * g_pds
-                        g_xp_local[0] += -d_kernel_grad * (M_center[0, 0] * cx_diff_circ_normed + M_center[1, 0] * cy_diff_circ_normed)
-                        g_xp_local[1] += -d_kernel_grad * (M_center[0, 1] * cx_diff_circ_normed + M_center[1, 1] * cy_diff_circ_normed)
-                        
-                        g_Mp_local[0, 0] += d_kernel_grad * cx_diff_circ_normed * cx_diff
-                        g_Mp_local[0, 1] += d_kernel_grad * cx_diff_circ_normed * cy_diff
-                        g_Mp_local[1, 0] += d_kernel_grad * cy_diff_circ_normed * cx_diff
-                        g_Mp_local[1, 1] += d_kernel_grad * cy_diff_circ_normed * cy_diff
-        
-        grad_Ep[idx] = g_Ep_local
-        grad_xp[:, idx] = g_xp_local
-        grad_Mp[:, :, idx] = g_Mp_local
-    
-    return (torch.from_numpy(grad_Ep).to(Ep.device),
-            torch.from_numpy(grad_xp).to(xp.device),
-            torch.from_numpy(grad_Mp).to(Mp.device))
-
-
 @pytest.mark.skipif(not EXTENSION_AVAILABLE, reason="PhotonDifferentialSplatting extension not built")
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 class TestPhotonDifferentialNumerical:
-    """Test numerical equivalence of optimized kernels."""
+    """Test numerical equivalence of optimized kernels against original unoptimized CUDA kernels."""
     
     def create_test_inputs(self, num_photons=100, seed=42):
         """Create deterministic test inputs for reproducibility."""
@@ -249,20 +44,21 @@ class TestPhotonDifferentialNumerical:
         return Ep, xp, Mp, cp, radius
     
     def test_forward_numerical_equivalence(self):
-        """Test that forward pass produces numerically equivalent results to reference implementation."""
-        # Create test inputs with small number for manageable CPU computation
-        Ep, xp, Mp, cp, radius = self.create_test_inputs(num_photons=20)
+        """Test that optimized forward pass produces numerically equivalent results to original CUDA kernel."""
+        # Create test inputs
+        Ep, xp, Mp, cp, radius = self.create_test_inputs(num_photons=50)
         
         # Set up output parameters
-        output_size = [3, 64, 64]
-        max_pixel_radius = 20
+        output_size = [3, 256, 256]
+        max_pixel_radius = 50
         
         # Run optimized CUDA kernel
         result_optimized = pds.pds_forward(Ep, xp, Mp, cp, radius, output_size, max_pixel_radius)
         pds_grid_optimized = result_optimized[0]
         
-        # Run reference implementation (unoptimized logic)
-        pds_grid_reference = reference_pds_forward(Ep, xp, Mp, cp, radius, output_size, max_pixel_radius)
+        # Run original unoptimized CUDA kernel
+        result_original = pds.pds_forward_original(Ep, xp, Mp, cp, radius, output_size, max_pixel_radius)
+        pds_grid_original = result_original[0]
         
         # Validate output shape and properties
         assert pds_grid_optimized.shape == torch.Size(output_size), f"Output shape mismatch: {pds_grid_optimized.shape} vs {output_size}"
@@ -271,12 +67,12 @@ class TestPhotonDifferentialNumerical:
         assert torch.all(pds_grid_optimized >= 0), "Output should be non-negative"
         assert torch.isfinite(pds_grid_optimized).all(), "Output should not contain NaN or Inf"
         
-        # Compare optimized vs reference implementation
+        # Compare optimized vs original unoptimized CUDA kernel
         # Allow tolerance appropriate for float32 and atomic operations
-        assert torch.allclose(pds_grid_optimized, pds_grid_reference, rtol=1e-5, atol=1e-6), \
-            f"Optimized kernel output does not match reference implementation.\n" \
-            f"Max difference: {torch.max(torch.abs(pds_grid_optimized - pds_grid_reference)).item()}\n" \
-            f"Mean difference: {torch.mean(torch.abs(pds_grid_optimized - pds_grid_reference)).item()}"
+        assert torch.allclose(pds_grid_optimized, pds_grid_original, rtol=1e-5, atol=1e-6), \
+            f"Optimized kernel output does not match original unoptimized CUDA kernel.\n" \
+            f"Max difference: {torch.max(torch.abs(pds_grid_optimized - pds_grid_original)).item()}\n" \
+            f"Mean difference: {torch.mean(torch.abs(pds_grid_optimized - pds_grid_original)).item()}"
         
         # Test reproducibility of optimized kernel
         result2 = pds.pds_forward(Ep, xp, Mp, cp, radius, output_size, max_pixel_radius)
@@ -285,20 +81,21 @@ class TestPhotonDifferentialNumerical:
             "Optimized forward pass should be reproducible with same inputs"
     
     def test_backward_numerical_equivalence(self):
-        """Test that backward pass produces numerically equivalent results to reference implementation."""
-        # Create test inputs with small number for manageable CPU computation
-        Ep, xp, Mp, cp, radius = self.create_test_inputs(num_photons=20)
+        """Test that optimized backward pass produces numerically equivalent results to original CUDA kernel."""
+        # Create test inputs
+        Ep, xp, Mp, cp, radius = self.create_test_inputs(num_photons=50)
         
         # Create gradient input
-        grad_pds = torch.rand(3, 64, 64, dtype=torch.float32, device='cuda')
-        max_pixel_radius = 20
+        grad_pds = torch.rand(3, 256, 256, dtype=torch.float32, device='cuda')
+        max_pixel_radius = 50
         
         # Run optimized CUDA kernel
         result_optimized = pds.pds_backward(grad_pds, Ep, xp, Mp, cp, radius, max_pixel_radius)
         grad_Ep_opt, grad_xp_opt, grad_Mp_opt = result_optimized
         
-        # Run reference implementation (unoptimized logic)
-        grad_Ep_ref, grad_xp_ref, grad_Mp_ref = reference_pds_backward(grad_pds, Ep, xp, Mp, cp, radius, max_pixel_radius)
+        # Run original unoptimized CUDA kernel
+        result_original = pds.pds_backward_original(grad_pds, Ep, xp, Mp, cp, radius, max_pixel_radius)
+        grad_Ep_orig, grad_xp_orig, grad_Mp_orig = result_original
         
         # Validate output structure
         assert len(result_optimized) == 3, "Backward should return gradients for Ep, xp, Mp"
@@ -317,19 +114,19 @@ class TestPhotonDifferentialNumerical:
         assert torch.isfinite(grad_xp_opt).all(), "grad_xp should not contain NaN or Inf"
         assert torch.isfinite(grad_Mp_opt).all(), "grad_Mp should not contain NaN or Inf"
         
-        # Compare optimized vs reference implementation
+        # Compare optimized vs original unoptimized CUDA kernel
         # Allow tolerance appropriate for float32
-        assert torch.allclose(grad_Ep_opt, grad_Ep_ref, rtol=1e-5, atol=1e-6), \
-            f"Optimized grad_Ep does not match reference.\n" \
-            f"Max diff: {torch.max(torch.abs(grad_Ep_opt - grad_Ep_ref)).item()}"
+        assert torch.allclose(grad_Ep_opt, grad_Ep_orig, rtol=1e-5, atol=1e-6), \
+            f"Optimized grad_Ep does not match original unoptimized CUDA kernel.\n" \
+            f"Max diff: {torch.max(torch.abs(grad_Ep_opt - grad_Ep_orig)).item()}"
         
-        assert torch.allclose(grad_xp_opt, grad_xp_ref, rtol=1e-5, atol=1e-6), \
-            f"Optimized grad_xp does not match reference.\n" \
-            f"Max diff: {torch.max(torch.abs(grad_xp_opt - grad_xp_ref)).item()}"
+        assert torch.allclose(grad_xp_opt, grad_xp_orig, rtol=1e-5, atol=1e-6), \
+            f"Optimized grad_xp does not match original unoptimized CUDA kernel.\n" \
+            f"Max diff: {torch.max(torch.abs(grad_xp_opt - grad_xp_orig)).item()}"
         
-        assert torch.allclose(grad_Mp_opt, grad_Mp_ref, rtol=1e-5, atol=1e-6), \
-            f"Optimized grad_Mp does not match reference.\n" \
-            f"Max diff: {torch.max(torch.abs(grad_Mp_opt - grad_Mp_ref)).item()}"
+        assert torch.allclose(grad_Mp_opt, grad_Mp_orig, rtol=1e-5, atol=1e-6), \
+            f"Optimized grad_Mp does not match original unoptimized CUDA kernel.\n" \
+            f"Max diff: {torch.max(torch.abs(grad_Mp_opt - grad_Mp_orig)).item()}"
         
         # Test reproducibility of optimized kernel
         result2 = pds.pds_backward(grad_pds, Ep, xp, Mp, cp, radius, max_pixel_radius)

@@ -67,8 +67,8 @@ This document describes the optimizations applied to the photon differential spl
 
 #### 4.1 Numerical Equivalence Tests
 - `test_forward_numerical_equivalence`: Validates forward pass correctness
-  - Compares optimized CUDA kernel against reference implementation
-  - Reference implementation (`reference_pds_forward`) replicates original unoptimized kernel logic in Python/NumPy
+  - Compares optimized CUDA kernel against original unoptimized CUDA kernel
+  - Original kernel (`pds_forward_original`) included in codebase with offset-based loops
   - Deterministic inputs with fixed seed
   - Shape validation
   - Finite value checks
@@ -76,8 +76,8 @@ This document describes the optimizations applied to the photon differential spl
   - Tight tolerance: rtol=1e-5, atol=1e-6
   
 - `test_backward_numerical_equivalence`: Validates backward pass correctness
-  - Compares optimized CUDA kernel against reference implementation
-  - Reference implementation (`reference_pds_backward`) replicates original unoptimized kernel logic
+  - Compares optimized CUDA kernel against original unoptimized CUDA kernel
+  - Original kernel (`pds_backward_original`) included in codebase
   - Gradient shape matching
   - Finite gradient checks
   - Reproducibility verification
@@ -87,7 +87,7 @@ This document describes the optimizations applied to the photon differential spl
   - Uses PyTorch autograd
   - Validates gradient computation
 
-**Reference Implementations**: The test suite includes CPU-based reference implementations (`reference_pds_forward` and `reference_pds_backward`) that exactly replicate the logic of the original unoptimized CUDA kernels. These functions use the same algorithms (Silverman kernel, offset-based loops, etc.) to serve as ground truth for validating numerical equivalence of the optimizations.
+**Original Unoptimized Kernels**: The CUDA file includes both optimized and original unoptimized kernel implementations (`pds_cuda_forward_kernel_original` and `pds_cuda_backward_kernel_original`). These original kernels use the same algorithms (Silverman kernel, offset-based loops, block size 512, etc.) as the pre-optimization code and serve as ground truth for validating numerical equivalence of the optimizations.
 
 #### 4.2 Performance Tests
 - `test_forward_performance_benchmark`: Forward pass timing

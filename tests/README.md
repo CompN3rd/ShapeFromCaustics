@@ -35,12 +35,12 @@ pytest tests/ -v -s
 ## Test Categories
 
 ### Numerical Equivalence Tests (`TestPhotonDifferentialNumerical`)
-Validates that the optimized CUDA kernels produce numerically correct results by comparing against reference implementations:
-- `test_forward_numerical_equivalence`: Compares optimized forward kernel against reference implementation matching the original unoptimized logic
-- `test_backward_numerical_equivalence`: Compares optimized backward kernel against reference implementation
+Validates that the optimized CUDA kernels produce numerically correct results by comparing against the original unoptimized CUDA kernels:
+- `test_forward_numerical_equivalence`: Compares optimized forward kernel against original unoptimized CUDA kernel
+- `test_backward_numerical_equivalence`: Compares optimized backward kernel against original unoptimized CUDA kernel
 - `test_forward_backward_consistency`: Tests end-to-end gradient computation with PyTorch autograd
 
-**Reference Implementation**: The tests include CPU-based reference implementations (`reference_pds_forward` and `reference_pds_backward`) that replicate the exact logic of the original unoptimized CUDA kernels. These serve as ground truth for validating the optimized kernels maintain numerical equivalence.
+**Reference Implementation**: The tests use the original unoptimized CUDA kernels (`pds_forward_original` and `pds_backward_original`) that are included in the codebase. These kernels use the original implementation with offset-based loops and serve as ground truth for validating the optimized kernels maintain numerical equivalence.
 
 ### Performance Tests (`TestPhotonDifferentialPerformance`)
 Benchmarks the optimized kernels to ensure no performance regression:
