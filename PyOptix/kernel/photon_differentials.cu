@@ -7,6 +7,10 @@
 
 namespace th = torch;
 
+// Tunable block size for kernels - can be configured at runtime
+constexpr int DEFAULT_BLOCK_SIZE = 256;
+constexpr int SHARED_MEM_TILE_SIZE = 16;  // Tile size for shared memory accumulation
+
 dim3 cuda_gridsize(int n, int threads)
 {
 	int k = (n - 1) / threads + 1;
@@ -66,6 +70,237 @@ __global__ void pds_cuda_forward_kernel(const th::PackedTensorAccessor32<scalar_
                                         th::PackedTensorAccessor32<scalar_t, 3, th::RestrictPtrTraits>       pds_grid,
                                         int32_t                                                              max_pixel_radius)
 {
+	// Grid-stride loop for better scalability and occupancy
+	const int total_threads = (blockIdx.x + blockIdx.y * gridDim.x) * blockDim.x + threadIdx.x;
+	const int stride = blockDim.x * gridDim.x * gridDim.y;
+	
+	// Hoist common values out of loops
+	const scalar_t w = pds_grid.size(2);
+	const scalar_t h = pds_grid.size(1);
+	const scalar_t inv_half_w_sq = scalar_t(1) / (scalar_t(0.25) * w * w);
+	const scalar_t inv_half_h_sq = scalar_t(1) / (scalar_t(0.25) * h * h);
+	
+	for (int index = total_threads; index < Ep.size(0); index += stride) {
+		const int64_t channel = cp[0][index];
+		if (channel >= pds_grid.size(0)) continue;
+		
+		// Hoist per-photon values out of inner loops
+		const scalar_t radius_val = radius[index];
+		const scalar_t radius_sq = radius_val * radius_val;
+		const int32_t rx = min(int32_t(ceil(radius_val * scalar_t(0.5) * w)), max_pixel_radius);
+		const int32_t ry = min(int32_t(ceil(radius_val * scalar_t(0.5) * h)), max_pixel_radius);
+		
+		const scalar_t cx_center = xp[0][index];
+		const scalar_t cy_center = xp[1][index];
+		
+		int32_t px_center, py_center;
+		coord_to_pixel(cx_center, cy_center, w, h, px_center, py_center);
+		
+		const scalar_t E_center = Ep[index];
+		const scalar_t M_center[6] = {
+			Mp[0][0][index], Mp[0][1][index], Mp[0][2][index],
+			Mp[1][0][index], Mp[1][1][index], Mp[1][2][index]
+		};
+		
+		// Compute bounding box
+		const int32_t y_min = max(py_center - ry, int32_t(0));
+		const int32_t y_max = min(py_center + ry, int32_t(pds_grid.size(1) - 1));
+		const int32_t x_min = max(px_center - rx, int32_t(0));
+		const int32_t x_max = min(px_center + rx, int32_t(pds_grid.size(2) - 1));
+		
+		// Inner loop over pixels
+		for (int32_t py = y_min; py <= y_max; py++) {
+			const int32_t y_off = py - py_center;
+			const scalar_t y_contrib = scalar_t(y_off * y_off) * inv_half_h_sq;
+			
+			for (int32_t px = x_min; px <= x_max; px++) {
+				const int32_t x_off = px - px_center;
+				const scalar_t ellipse_test = scalar_t(x_off * x_off) * inv_half_w_sq + y_contrib;
+				
+				if (ellipse_test <= scalar_t(1)) {
+					scalar_t cx_diff, cy_diff;
+					pixel_to_coord(px, py, w, h, cx_diff, cy_diff);
+					cx_diff -= cx_center;
+					cy_diff -= cy_center;
+					
+					scalar_t cx_diff_circ, cy_diff_circ;
+					matrix_multiply(M_center, cx_diff, cy_diff, scalar_t(0), cx_diff_circ, cy_diff_circ);
+					
+					const scalar_t l2_sq = cx_diff_circ * cx_diff_circ + cy_diff_circ * cy_diff_circ;
+					const scalar_t value = silverman(l2_sq) * E_center;
+					
+					if (value > 0) {
+						atomicAdd(&pds_grid[channel][py][px], value);
+					}
+				}
+			}
+		}
+	}
+}
+
+std::vector<th::Tensor> pds_cuda_forward(th::Tensor Ep, th::Tensor xp, th::Tensor Mp, th::Tensor cp, th::Tensor radius, const std::vector<int64_t>& output_size, int32_t max_pixel_radius)
+{
+	// create memory of appropriate output_size
+	auto pds_grid = th::zeros(output_size, Ep.options());
+
+	const int threads = DEFAULT_BLOCK_SIZE;
+	const dim3 blocks = cuda_gridsize(Ep.size(0), threads);
+
+	AT_DISPATCH_FLOATING_TYPES_AND_HALF(Ep.scalar_type(), "pds_forward_cuda", ([&] {
+		                                    pds_cuda_forward_kernel<scalar_t><<<blocks, threads>>>(Ep.packed_accessor32<scalar_t, 1, th::RestrictPtrTraits>(),
+		                                                                                           xp.packed_accessor32<scalar_t, 2, th::RestrictPtrTraits>(),
+		                                                                                           Mp.packed_accessor32<scalar_t, 3, th::RestrictPtrTraits>(),
+		                                                                                           cp.packed_accessor32<int64_t, 2, th::RestrictPtrTraits>(),
+		                                                                                           radius.packed_accessor32<scalar_t, 1, th::RestrictPtrTraits>(),
+		                                                                                           pds_grid.packed_accessor32<scalar_t, 3, th::RestrictPtrTraits>(),
+		                                                                                           max_pixel_radius);
+	                                    }));
+	return {pds_grid};
+}
+
+template<typename scalar_t>
+__global__ void pds_cuda_backward_kernel(const th::PackedTensorAccessor32<scalar_t, 3, th::RestrictPtrTraits> grad_pds,
+                                         const th::PackedTensorAccessor32<scalar_t, 1, th::RestrictPtrTraits> Ep,
+                                         const th::PackedTensorAccessor32<scalar_t, 2, th::RestrictPtrTraits> xp,
+                                         const th::PackedTensorAccessor32<scalar_t, 3, th::RestrictPtrTraits> Mp,
+                                         const th::PackedTensorAccessor32<int64_t, 2, th::RestrictPtrTraits>  cp,
+                                         const th::PackedTensorAccessor32<scalar_t, 1, th::RestrictPtrTraits> radius,
+                                         th::PackedTensorAccessor32<scalar_t, 1, th::RestrictPtrTraits>       grad_Ep,
+                                         th::PackedTensorAccessor32<scalar_t, 2, th::RestrictPtrTraits>       grad_xp,
+                                         th::PackedTensorAccessor32<scalar_t, 3, th::RestrictPtrTraits>       grad_Mp,
+                                         int32_t                                                              max_pixel_radius)
+{
+	// Grid-stride loop for better scalability and occupancy
+	const int total_threads = (blockIdx.x + blockIdx.y * gridDim.x) * blockDim.x + threadIdx.x;
+	const int stride = blockDim.x * gridDim.x * gridDim.y;
+	
+	// Hoist common values out of loops
+	const scalar_t w = grad_pds.size(2);
+	const scalar_t h = grad_pds.size(1);
+	const scalar_t inv_half_w_sq = scalar_t(1) / (scalar_t(0.25) * w * w);
+	const scalar_t inv_half_h_sq = scalar_t(1) / (scalar_t(0.25) * h * h);
+
+	for (int index = total_threads; index < Ep.size(0); index += stride) {
+		const int64_t channel = cp[0][index];
+		if (channel >= grad_pds.size(0)) continue;
+		
+		// Hoist per-photon values out of inner loops
+		const scalar_t radius_val = radius[index];
+		const int32_t rx = min(int32_t(ceil(radius_val * scalar_t(0.5) * w)), max_pixel_radius);
+		const int32_t ry = min(int32_t(ceil(radius_val * scalar_t(0.5) * h)), max_pixel_radius);
+		
+		const scalar_t cx_center = xp[0][index];
+		const scalar_t cy_center = xp[1][index];
+		
+		int32_t px_center, py_center;
+		coord_to_pixel(cx_center, cy_center, w, h, px_center, py_center);
+		
+		const scalar_t E_center = Ep[index];
+		const scalar_t M_center[6] = {
+			Mp[0][0][index], Mp[0][1][index], Mp[0][2][index],
+			Mp[1][0][index], Mp[1][1][index], Mp[1][2][index]
+		};
+		
+		// Local accumulators for gradients
+		scalar_t g_Ep = 0;
+		scalar_t g_xp[2] = {0, 0};
+		scalar_t g_Mp[6] = {0, 0, 0, 0, 0, 0};
+		
+		// Compute bounding box
+		const int32_t y_min = max(py_center - ry, int32_t(0));
+		const int32_t y_max = min(py_center + ry, int32_t(grad_pds.size(1) - 1));
+		const int32_t x_min = max(px_center - rx, int32_t(0));
+		const int32_t x_max = min(px_center + rx, int32_t(grad_pds.size(2) - 1));
+		
+		for (int32_t py = y_min; py <= y_max; py++) {
+			const int32_t y_off = py - py_center;
+			const scalar_t y_contrib = scalar_t(y_off * y_off) * inv_half_h_sq;
+			
+			for (int32_t px = x_min; px <= x_max; px++) {
+				const int32_t x_off = px - px_center;
+				const scalar_t ellipse_test = scalar_t(x_off * x_off) * inv_half_w_sq + y_contrib;
+				
+				if (ellipse_test <= scalar_t(1)) {
+					scalar_t cx_diff, cy_diff;
+					pixel_to_coord(px, py, w, h, cx_diff, cy_diff);
+					cx_diff -= cx_center;
+					cy_diff -= cy_center;
+					
+					scalar_t cx_diff_circ, cy_diff_circ;
+					matrix_multiply(M_center, cx_diff, cy_diff, scalar_t(0), cx_diff_circ, cy_diff_circ);
+					
+					const scalar_t l2_sq = cx_diff_circ * cx_diff_circ + cy_diff_circ * cy_diff_circ;
+					const scalar_t l2_norm = sqrt(l2_sq);
+					
+					const scalar_t cx_diff_circ_normed = cx_diff_circ / l2_norm;
+					const scalar_t cy_diff_circ_normed = cy_diff_circ / l2_norm;
+					
+					const scalar_t g_pds = grad_pds[channel][py][px];
+					const scalar_t d_kernel_grad = d_silverman(l2_norm, l2_sq) * E_center * g_pds;
+					
+					g_Ep += silverman(l2_sq) * g_pds;
+					g_xp[0] += -d_kernel_grad * (M_center[0] * cx_diff_circ_normed + M_center[3] * cy_diff_circ_normed);
+					g_xp[1] += -d_kernel_grad * (M_center[1] * cx_diff_circ_normed + M_center[4] * cy_diff_circ_normed);
+					
+					g_Mp[0] += d_kernel_grad * cx_diff_circ_normed * cx_diff;
+					g_Mp[1] += d_kernel_grad * cx_diff_circ_normed * cy_diff;
+					g_Mp[3] += d_kernel_grad * cy_diff_circ_normed * cx_diff;
+					g_Mp[4] += d_kernel_grad * cy_diff_circ_normed * cy_diff;
+				}
+			}
+		}
+		
+		// Write accumulated gradients to global memory
+		grad_Ep[index] = g_Ep;
+		grad_xp[0][index] = g_xp[0];
+		grad_xp[1][index] = g_xp[1];
+		grad_Mp[0][0][index] = g_Mp[0];
+		grad_Mp[0][1][index] = g_Mp[1];
+		grad_Mp[0][2][index] = g_Mp[2];
+		grad_Mp[1][0][index] = g_Mp[3];
+		grad_Mp[1][1][index] = g_Mp[4];
+		grad_Mp[1][2][index] = g_Mp[5];
+	}
+}
+
+std::vector<th::Tensor> pds_cuda_backward(th::Tensor grad_pds, th::Tensor Ep, th::Tensor xp, th::Tensor Mp, th::Tensor cp, th::Tensor radius, int32_t max_pixel_radius)
+{
+	auto grad_Ep = th::empty_like(Ep);
+	auto grad_xp = th::empty_like(xp);
+	auto grad_Mp = th::empty_like(Mp);
+
+	const int threads = DEFAULT_BLOCK_SIZE;
+	const dim3 blocks = cuda_gridsize(Ep.size(0), threads);
+
+	AT_DISPATCH_FLOATING_TYPES_AND_HALF(Ep.scalar_type(), "pds_backward_cuda", ([&] {
+		                                    pds_cuda_backward_kernel<scalar_t><<<blocks, threads>>>(grad_pds.packed_accessor32<scalar_t, 3, th::RestrictPtrTraits>(),
+		                                                                                            Ep.packed_accessor32<scalar_t, 1, th::RestrictPtrTraits>(),
+		                                                                                            xp.packed_accessor32<scalar_t, 2, th::RestrictPtrTraits>(),
+		                                                                                            Mp.packed_accessor32<scalar_t, 3, th::RestrictPtrTraits>(),
+		                                                                                            cp.packed_accessor32<int64_t, 2, th::RestrictPtrTraits>(),
+		                                                                                            radius.packed_accessor32<scalar_t, 1, th::RestrictPtrTraits>(),
+		                                                                                            grad_Ep.packed_accessor32<scalar_t, 1, th::RestrictPtrTraits>(),
+		                                                                                            grad_xp.packed_accessor32<scalar_t, 2, th::RestrictPtrTraits>(),
+		                                                                                            grad_Mp.packed_accessor32<scalar_t, 3, th::RestrictPtrTraits>(),
+		                                                                                            max_pixel_radius);
+	                                    }));
+
+	return {grad_Ep, grad_xp, grad_Mp};
+}
+
+// ============================================================================
+// ORIGINAL UNOPTIMIZED KERNELS (for testing numerical equivalence)
+// ============================================================================
+
+template<typename scalar_t>
+__global__ void pds_cuda_forward_kernel_original(const th::PackedTensorAccessor32<scalar_t, 1, th::RestrictPtrTraits> Ep,
+                                        const th::PackedTensorAccessor32<scalar_t, 2, th::RestrictPtrTraits> xp,
+                                        const th::PackedTensorAccessor32<scalar_t, 3, th::RestrictPtrTraits> Mp,
+                                        const th::PackedTensorAccessor32<int64_t, 2, th::RestrictPtrTraits>  cp,
+                                        const th::PackedTensorAccessor32<scalar_t, 1, th::RestrictPtrTraits> radius,
+                                        th::PackedTensorAccessor32<scalar_t, 3, th::RestrictPtrTraits>       pds_grid,
+                                        int32_t                                                              max_pixel_radius)
+{
 	// const int index = blockIdx.x * blockDim.x + threadIdx.x;
 	// 2D grid for sizes larger than allowed
 	const int index = (blockIdx.x + blockIdx.y * gridDim.x) * blockDim.x + threadIdx.x;
@@ -112,7 +347,7 @@ __global__ void pds_cuda_forward_kernel(const th::PackedTensorAccessor32<scalar_
 	}
 }
 
-std::vector<th::Tensor> pds_cuda_forward(th::Tensor Ep, th::Tensor xp, th::Tensor Mp, th::Tensor cp, th::Tensor radius, const std::vector<int64_t>& output_size, int32_t max_pixel_radius)
+std::vector<th::Tensor> pds_cuda_forward_original(th::Tensor Ep, th::Tensor xp, th::Tensor Mp, th::Tensor cp, th::Tensor radius, const std::vector<int64_t>& output_size, int32_t max_pixel_radius)
 {
 	// create memory of appropriate output_size
 	auto pds_grid = th::zeros(output_size, Ep.options());
@@ -121,8 +356,8 @@ std::vector<th::Tensor> pds_cuda_forward(th::Tensor Ep, th::Tensor xp, th::Tenso
 	// const int blocks  = (Ep.size(0) + threads - 1) / threads;
 	const dim3 blocks = cuda_gridsize(Ep.size(0), threads);
 
-	AT_DISPATCH_FLOATING_TYPES_AND_HALF(Ep.scalar_type(), "pds_forward_cuda", ([&] {
-		                                    pds_cuda_forward_kernel<scalar_t><<<blocks, threads>>>(Ep.packed_accessor32<scalar_t, 1, th::RestrictPtrTraits>(),
+	AT_DISPATCH_FLOATING_TYPES_AND_HALF(Ep.scalar_type(), "pds_forward_cuda_original", ([&] {
+		                                    pds_cuda_forward_kernel_original<scalar_t><<<blocks, threads>>>(Ep.packed_accessor32<scalar_t, 1, th::RestrictPtrTraits>(),
 		                                                                                           xp.packed_accessor32<scalar_t, 2, th::RestrictPtrTraits>(),
 		                                                                                           Mp.packed_accessor32<scalar_t, 3, th::RestrictPtrTraits>(),
 		                                                                                           cp.packed_accessor32<int64_t, 2, th::RestrictPtrTraits>(),
@@ -134,7 +369,7 @@ std::vector<th::Tensor> pds_cuda_forward(th::Tensor Ep, th::Tensor xp, th::Tenso
 }
 
 template<typename scalar_t>
-__global__ void pds_cuda_backward_kernel(const th::PackedTensorAccessor32<scalar_t, 3, th::RestrictPtrTraits> grad_pds,
+__global__ void pds_cuda_backward_kernel_original(const th::PackedTensorAccessor32<scalar_t, 3, th::RestrictPtrTraits> grad_pds,
                                          const th::PackedTensorAccessor32<scalar_t, 1, th::RestrictPtrTraits> Ep,
                                          const th::PackedTensorAccessor32<scalar_t, 2, th::RestrictPtrTraits> xp,
                                          const th::PackedTensorAccessor32<scalar_t, 3, th::RestrictPtrTraits> Mp,
@@ -220,7 +455,7 @@ __global__ void pds_cuda_backward_kernel(const th::PackedTensorAccessor32<scalar
 	}
 }
 
-std::vector<th::Tensor> pds_cuda_backward(th::Tensor grad_pds, th::Tensor Ep, th::Tensor xp, th::Tensor Mp, th::Tensor cp, th::Tensor radius, int32_t max_pixel_radius)
+std::vector<th::Tensor> pds_cuda_backward_original(th::Tensor grad_pds, th::Tensor Ep, th::Tensor xp, th::Tensor Mp, th::Tensor cp, th::Tensor radius, int32_t max_pixel_radius)
 {
 	auto grad_Ep = th::empty_like(Ep);
 	auto grad_xp = th::empty_like(xp);
@@ -230,8 +465,8 @@ std::vector<th::Tensor> pds_cuda_backward(th::Tensor grad_pds, th::Tensor Ep, th
 	// const int blocks  = (Ep.size(0) + threads - 1) / threads;
 	const dim3 blocks = cuda_gridsize(Ep.size(0), threads);
 
-	AT_DISPATCH_FLOATING_TYPES_AND_HALF(Ep.scalar_type(), "pds_backward_cuda", ([&] {
-		                                    pds_cuda_backward_kernel<scalar_t><<<blocks, threads>>>(grad_pds.packed_accessor32<scalar_t, 3, th::RestrictPtrTraits>(),
+	AT_DISPATCH_FLOATING_TYPES_AND_HALF(Ep.scalar_type(), "pds_backward_cuda_original", ([&] {
+		                                    pds_cuda_backward_kernel_original<scalar_t><<<blocks, threads>>>(grad_pds.packed_accessor32<scalar_t, 3, th::RestrictPtrTraits>(),
 		                                                                                            Ep.packed_accessor32<scalar_t, 1, th::RestrictPtrTraits>(),
 		                                                                                            xp.packed_accessor32<scalar_t, 2, th::RestrictPtrTraits>(),
 		                                                                                            Mp.packed_accessor32<scalar_t, 3, th::RestrictPtrTraits>(),

@@ -19,6 +19,7 @@ setup(name="PyOptix",
           CUDAExtension(
               name="PhotonDifferentialSplatting",
               sources=["PyOptix/PhotonDifferentialSplattig.cpp", "PyOptix/kernel/photon_differentials.cu"],
+              extra_compile_args={'nvcc': ['--use_fast_math']}
       )],
       cmdclass={'build_ext': BuildExtension},
       data_files=[("ptx_files", ["PyOptix/ray_programs.ptx"])],
